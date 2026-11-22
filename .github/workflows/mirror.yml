@@ -1,4 +1,3 @@
-
 name: Import or Sync Git Repository
 
 on:
@@ -37,7 +36,7 @@ on:
       source_ref_type:
         description: "Whether the source reference is a branch or a tag"
         required: true
-        default: branch
+        default: tag
         type: choice
         options:
           - branch
@@ -46,7 +45,7 @@ on:
       source_ref:
         description: "Source branch name or tag name"
         required: true
-        default: "android16-6.12-2026-03"
+        default: "android16-6.12-2025-07_r29"
         type: string
 
       target_branch:
@@ -70,6 +69,7 @@ on:
         default: 1000
         type: number
 
+# This workflow authenticates with GH_PAT, not GITHUB_TOKEN.
 permissions: {}
 
 jobs:
@@ -113,12 +113,27 @@ jobs:
             exit 1
           fi
 
+          case "$REPOSITORY_ACTION" in
+            create|use) ;;
+            *)
+              echo "::error::Invalid repository_action: $REPOSITORY_ACTION"
+              exit 1
+              ;;
+          esac
+
+          case "$VISIBILITY" in
+            private|public) ;;
+            *)
+              echo "::error::Invalid visibility: $VISIBILITY"
+              exit 1
+              ;;
+          esac
+
           if [[ "$REPOSITORY_NAME" == */* ]]; then
             if [[ "$REPOSITORY_NAME" == */*/* ]]; then
               echo "::error::Use repo or owner/repo, not a URL."
               exit 1
             fi
-
             DEST_OWNER="${REPOSITORY_NAME%%/*}"
             DEST_REPO="${REPOSITORY_NAME#*/}"
           else
@@ -137,7 +152,6 @@ jobs:
           fi
 
           DEST="$DEST_OWNER/$DEST_REPO"
-
           echo "Destination: $DEST"
 
           case "$REPOSITORY_ACTION" in
@@ -167,11 +181,6 @@ jobs:
                 echo "set_default=false" >> "$GITHUB_OUTPUT"
               fi
               ;;
-
-            *)
-              echo "::error::Invalid repository_action."
-              exit 1
-              ;;
           esac
 
           echo "owner=$DEST_OWNER" >> "$GITHUB_OUTPUT"
@@ -196,7 +205,6 @@ jobs:
           WORKDIR="$GITHUB_WORKSPACE/mirror-repo"
           mkdir -p "$WORKDIR"
           cd "$WORKDIR"
-
           git init
 
           if [[ -z "$SOURCE_URL" ]]; then
@@ -204,77 +212,83 @@ jobs:
             exit 1
           fi
 
+          # Accept either a plain ref name or a refs/{heads,tags}/ prefixed name.
+          SOURCE_REF_NAME="${SOURCE_REF_NAME:-${SOURCE_REF:-}}"
+
           if [[ -z "$SOURCE_REF_NAME" ]]; then
             echo "::error::source_ref cannot be empty."
             exit 1
           fi
 
-          if ! git check-ref-format "refs/heads/$TARGET_BRANCH"; then
-            echo "::error::Invalid target branch name."
+          if ! git check-ref-format --branch "$TARGET_BRANCH" >/dev/null 2>&1; then
+            echo "::error::Invalid target branch name: $TARGET_BRANCH"
             exit 1
           fi
 
           if [[ "$SYNC_MODE" != "sync" && "$SYNC_MODE" != "import" ]]; then
-            echo "::error::Invalid sync_mode."
+            echo "::error::Invalid sync_mode: $SYNC_MODE"
             exit 1
           fi
 
           git remote add source "$SOURCE_URL"
+          git remote add origin "https://github.com/$DEST_OWNER/$DEST_REPO.git"
 
-          git remote add origin \
-            "https://github.com/$DEST_OWNER/$DEST_REPO.git"
-
-          # Fetch either a branch or a tag.
-          # Annotated and lightweight tags are both supported.
-
+          # Use Git's own ref-name rules. This correctly accepts underscores,
+          # including android16-6.12-2025-07_r29.
           case "$SOURCE_REF_TYPE" in
-            branch)
-              if ! git check-ref-format "refs/heads/$SOURCE_REF_NAME"; then
-                echo "::error::Invalid source branch name."
-                exit 1
-              fi
-
-              echo "Fetching source branch: $SOURCE_REF_NAME"
-
-              git fetch --no-tags source \
-                "+refs/heads/$SOURCE_REF_NAME:refs/source/selected"
-              ;;
-
             tag)
-              if ! git check-ref-format "refs/tags/$SOURCE_REF_NAME"; then
-                echo "::error::Invalid source tag name."
+              SOURCE_REF_NAME="${SOURCE_REF_NAME#refs/tags/}"
+
+              if [[ -z "$SOURCE_REF_NAME" ]] ||
+                 ! git check-ref-format "refs/tags/$SOURCE_REF_NAME" >/dev/null 2>&1; then
+                echo "::error::Invalid source tag name: $SOURCE_REF_NAME"
                 exit 1
               fi
 
               echo "Fetching source tag: $SOURCE_REF_NAME"
 
-              git fetch --no-tags source \
-                "+refs/tags/$SOURCE_REF_NAME:refs/source-tags/selected"
+              if ! git fetch --no-tags source \
+                "+refs/tags/${SOURCE_REF_NAME}:refs/source-tags/selected"; then
+                echo "::error::Unable to fetch source tag: $SOURCE_REF_NAME"
+                exit 1
+              fi
 
-              # Peel the tag to its underlying commit.
-              TAG_COMMIT="$(git rev-parse --verify \
-                'refs/source-tags/selected^{commit}')" || {
+              # Peel both annotated and lightweight tags to their commit.
+              if ! SOURCE_COMMIT="$(git rev-parse --verify \
+                'refs/source-tags/selected^{commit}' 2>/dev/null)"; then
                 echo "::error::The selected tag does not resolve to a commit."
                 exit 1
-              }
+              fi
 
-              git update-ref refs/source/selected "$TAG_COMMIT"
+              git update-ref refs/source/selected "$SOURCE_COMMIT"
+              ;;
+
+            branch)
+              SOURCE_REF_NAME="${SOURCE_REF_NAME#refs/heads/}"
+
+              if [[ -z "$SOURCE_REF_NAME" ]] ||
+                 ! git check-ref-format "refs/heads/$SOURCE_REF_NAME" >/dev/null 2>&1; then
+                echo "::error::Invalid source branch name: $SOURCE_REF_NAME"
+                exit 1
+              fi
+
+              echo "Fetching source branch: $SOURCE_REF_NAME"
+
+              if ! git fetch --no-tags source \
+                "+refs/heads/${SOURCE_REF_NAME}:refs/source/selected"; then
+                echo "::error::Unable to fetch source branch: $SOURCE_REF_NAME"
+                exit 1
+              fi
               ;;
 
             *)
-              echo "::error::source_ref_type must be branch or tag."
+              echo "::error::Unsupported source_ref_type: $SOURCE_REF_TYPE"
               exit 1
               ;;
           esac
 
           SOURCE_REF="refs/source/selected"
-
-          SOURCE_COMMIT="$(git rev-parse --verify \
-            "$SOURCE_REF^{commit}")" || {
-            echo "::error::Source reference does not resolve to a commit."
-            exit 1
-          }
-
+          SOURCE_COMMIT="$(git rev-parse --verify "$SOURCE_REF^{commit}")"
           SOURCE_COUNT="$(git rev-list --count "$SOURCE_REF")"
 
           echo "Source type: $SOURCE_REF_TYPE"
@@ -282,11 +296,8 @@ jobs:
           echo "Source commit: $SOURCE_COMMIT"
           echo "Reachable commits: $SOURCE_COUNT"
 
-          # Inspect destination branch.
-
-          REMOTE_LINE="$(git ls-remote --heads origin \
-            "refs/heads/$TARGET_BRANCH")"
-
+          # Inspect the destination branch, if it already exists.
+          REMOTE_LINE="$(git ls-remote --heads origin "refs/heads/$TARGET_BRANCH")"
           TARGET_EXISTS=false
           TARGET_HAS_FILES=false
           TARGET_SHA=""
@@ -298,8 +309,13 @@ jobs:
             git fetch --no-tags origin \
               "+refs/heads/$TARGET_BRANCH:refs/destination/$TARGET_BRANCH"
 
-            if git ls-tree -r --name-only "$TARGET_SHA" |
-              awk 'END { exit (NR == 0) }'; then
+            TREE_LIST="$WORKDIR/destination-tree-list"
+            if ! git ls-tree -r -z --name-only "$TARGET_SHA" > "$TREE_LIST"; then
+              echo "::error::Unable to inspect the destination branch tree."
+              exit 1
+            fi
+
+            if [[ -s "$TREE_LIST" ]]; then
               TARGET_HAS_FILES=true
             fi
           fi
@@ -353,25 +369,17 @@ jobs:
             [[ -z "$SHA" ]] && continue
 
             echo "Pushing checkpoint $((CHECKPOINT_COUNT + 1)): $SHA"
-
-            git push origin \
-              "+$SHA:refs/heads/$STAGING_BRANCH"
-
+            git push origin "+$SHA:refs/heads/$STAGING_BRANCH"
             CHECKPOINT_COUNT=$((CHECKPOINT_COUNT + 1))
-
           done < <(
-            git log --format='%H' --reverse "$SOURCE_REF" |
+            git log --format='%H' --reverse --topo-order "$SOURCE_REF" |
               awk -v interval="$COMMITS_PER_PUSH" \
                 'NR % interval == 0 { print $1 }'
           )
 
           echo "Checkpoint pushes completed: $CHECKPOINT_COUNT"
-
           echo "Pushing final source commit..."
-
-          git push origin \
-            "+$SOURCE_REF:refs/heads/$STAGING_BRANCH"
-
+          git push origin "+$SOURCE_REF:refs/heads/$STAGING_BRANCH"
           echo "Source history transfer completed."
 
       - name: Import or synchronize destination branch
@@ -391,19 +399,14 @@ jobs:
           gh auth setup-git --hostname github.com
 
           STAGED_REF="refs/staged-source/selected"
-
           git fetch --no-tags origin \
             "+refs/heads/$STAGING_BRANCH:$STAGED_REF"
-
-          STAGED_HEAD="$(git rev-parse "$STAGED_REF")"
+          STAGED_HEAD="$(git rev-parse --verify "$STAGED_REF^{commit}")"
 
           echo "Staged source HEAD: $STAGED_HEAD"
 
-          # Recheck destination immediately before updating it.
-
-          REMOTE_LINE="$(git ls-remote --heads origin \
-            "refs/heads/$TARGET_BRANCH")"
-
+          # Recheck the destination immediately before updating it.
+          REMOTE_LINE="$(git ls-remote --heads origin "refs/heads/$TARGET_BRANCH")"
           TARGET_EXISTS=false
           TARGET_HAS_FILES=false
           TARGET_SHA=""
@@ -415,8 +418,13 @@ jobs:
             git fetch --no-tags origin \
               "+refs/heads/$TARGET_BRANCH:refs/destination/$TARGET_BRANCH"
 
-            if git ls-tree -r --name-only "$TARGET_SHA" |
-              awk 'END { exit (NR == 0) }'; then
+            TREE_LIST="$WORKDIR/destination-tree-list-final"
+            if ! git ls-tree -r -z --name-only "$TARGET_SHA" > "$TREE_LIST"; then
+              echo "::error::Unable to inspect the destination branch tree."
+              exit 1
+            fi
+
+            if [[ -s "$TREE_LIST" ]]; then
               TARGET_HAS_FILES=true
             fi
           fi
@@ -427,15 +435,11 @@ jobs:
           fi
 
           if [[ "$TARGET_HAS_FILES" == "true" && "$SYNC_MODE" == "sync" ]]; then
-
             echo "Synchronizing existing destination history."
-
             TARGET_REF="refs/destination/$TARGET_BRANCH"
-
             git switch --force-create mirror-sync-target "$TARGET_REF"
 
-            # Find common ancestor.
-
+            # Find a common ancestor, if one exists.
             MERGE_BASE="$(git merge-base "$TARGET_REF" "$STAGED_REF" || true)"
 
             if [[ -n "$MERGE_BASE" ]]; then
@@ -446,20 +450,16 @@ jobs:
 
             # Source already exists in destination.
             if git merge-base --is-ancestor "$STAGED_REF" HEAD; then
-
               echo "Source history is already included."
 
             # Destination is behind source.
             elif git merge-base --is-ancestor HEAD "$STAGED_REF"; then
-
               echo "Fast-forwarding destination."
               git merge --ff-only "$STAGED_REF"
 
             # Divergent histories with a common ancestor.
             elif [[ -n "$MERGE_BASE" ]]; then
-
               echo "Creating merge commit."
-
               if ! git merge --no-edit "$STAGED_REF"; then
                 git merge --abort || true
                 echo "::error::Merge conflicts. Destination was not updated."
@@ -468,9 +468,7 @@ jobs:
 
             # Unrelated histories.
             else
-
               echo "Merging unrelated histories."
-
               if ! git merge --allow-unrelated-histories --no-edit "$STAGED_REF"; then
                 git merge --abort || true
                 echo "::error::Unrelated-history merge conflicts."
@@ -478,43 +476,31 @@ jobs:
               fi
             fi
 
-            EXPECTED_SHA="$(git rev-parse HEAD)"
+            EXPECTED_SHA="$(git rev-parse --verify HEAD)"
 
-            # Normal non-force push.
+            # Normal non-force push. Concurrent destination changes will be rejected.
             git push origin "HEAD:refs/heads/$TARGET_BRANCH"
-
             RESULT_MODE=sync
-
           else
-
             echo "Missing or empty target branch. Performing fresh import."
 
             if [[ "$TARGET_EXISTS" == "true" ]]; then
-
-              # Replace empty branch only if its SHA has not changed.
-
+              # Replace an empty branch only if its SHA has not changed.
               git push \
                 "--force-with-lease=refs/heads/$TARGET_BRANCH:$TARGET_SHA" \
                 origin \
                 "$STAGED_REF:refs/heads/$TARGET_BRANCH"
-
             else
-
-              # Create a new branch.
-
-              git push origin \
-                "$STAGED_REF:refs/heads/$TARGET_BRANCH"
-
+              # Create a new branch. The push fails safely if it was created concurrently.
+              git push origin "$STAGED_REF:refs/heads/$TARGET_BRANCH"
             fi
 
             EXPECTED_SHA="$STAGED_HEAD"
             RESULT_MODE=import
-
           fi
 
           echo "expected_sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
           echo "result_mode=$RESULT_MODE" >> "$GITHUB_OUTPUT"
-
           echo "Operation: $RESULT_MODE"
           echo "Destination HEAD: $EXPECTED_SHA"
 
@@ -536,10 +522,7 @@ jobs:
           gh auth setup-git --hostname github.com
 
           DEST="$DEST_OWNER/$DEST_REPO"
-
-          REMOTE_LINE="$(git ls-remote --heads origin \
-            "refs/heads/$TARGET_BRANCH")"
-
+          REMOTE_LINE="$(git ls-remote --heads origin "refs/heads/$TARGET_BRANCH")"
           REMOTE_SHA="${REMOTE_LINE%%$'\t'*}"
 
           echo "Expected HEAD: $EXPECTED_SHA"
@@ -560,7 +543,6 @@ jobs:
           echo "========================================"
           echo "IMPORT/SYNC SUCCESSFUL"
           echo "========================================"
-
           echo "Repository: https://github.com/$DEST"
           echo "Branch: $TARGET_BRANCH"
           echo "HEAD: $REMOTE_SHA"
@@ -589,6 +571,4 @@ jobs:
           fi
 
           gh auth setup-git --hostname github.com
-
-          git -C "$WORKDIR" push origin \
-            --delete "$STAGING_BRANCH" || true
+          git -C "$WORKDIR" push origin --delete "$STAGING_BRANCH" || true
