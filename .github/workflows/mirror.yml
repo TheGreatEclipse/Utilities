@@ -1,0 +1,572 @@
+
+name: Import or Sync Git Repository
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_action:
+        description: "Create a new repository or use an existing one"
+        required: true
+        default: create
+        type: choice
+        options:
+          - create
+          - use
+
+      repository_name:
+        description: "Destination repository (repo or owner/repo)"
+        required: true
+        default: "android-common-6.12"
+        type: string
+
+      visibility:
+        description: "Visibility for a newly created repository"
+        required: true
+        default: private
+        type: choice
+        options:
+          - private
+          - public
+
+      source_url:
+        description: "Git clone URL of the source repository"
+        required: true
+        default: "https://android.googlesource.com/kernel/common"
+        type: string
+
+      source_branch:
+        description: "Branch to fetch from the source repository"
+        required: true
+        default: "android16-6.12-2026-03"
+        type: string
+
+      target_branch:
+        description: "Branch to create or update in the destination"
+        required: true
+        default: "android16-6.12-2026-03"
+        type: string
+
+      sync_mode:
+        description: "Sync a populated branch or import only into an empty branch"
+        required: true
+        default: sync
+        type: choice
+        options:
+          - sync
+          - import
+
+      commits_per_push:
+        description: "Number of commits between large-history push checkpoints"
+        required: true
+        default: 1000
+        type: number
+
+permissions: {}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure Git and GitHub authentication
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "::error::Missing repository secret GH_PAT."
+            exit 1
+          fi
+
+          git config --global user.name "GitHub Actions"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          gh auth setup-git --hostname github.com
+          gh auth status --hostname github.com
+
+      - name: Create or validate destination repository
+        id: destination
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          DEFAULT_OWNER: ${{ github.repository_owner }}
+          REPOSITORY_NAME: ${{ inputs.repository_name }}
+          REPOSITORY_ACTION: ${{ inputs.repository_action }}
+          VISIBILITY: ${{ inputs.visibility }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "$REPOSITORY_NAME" ]]; then
+            echo "::error::repository_name cannot be empty."
+            exit 1
+          fi
+
+          # Accept either "repo" (under the workflow owner)
+          # or "owner/repo".
+
+          if [[ "$REPOSITORY_NAME" == */* ]]; then
+            if [[ "$REPOSITORY_NAME" == */*/* ]]; then
+              echo "::error::Use repo or owner/repo, not a URL or a path with multiple slashes."
+              exit 1
+            fi
+
+            DEST_OWNER="${REPOSITORY_NAME%%/*}"
+            DEST_REPO="${REPOSITORY_NAME#*/}"
+          else
+            DEST_OWNER="$DEFAULT_OWNER"
+            DEST_REPO="$REPOSITORY_NAME"
+          fi
+
+          if [[ ! "$DEST_OWNER" =~ ^[A-Za-z0-9-]+$ ]]; then
+            echo "::error::Invalid destination owner: $DEST_OWNER"
+            exit 1
+          fi
+
+          if [[ ! "$DEST_REPO" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::Invalid destination repository name: $DEST_REPO"
+            exit 1
+          fi
+
+          DEST="$DEST_OWNER/$DEST_REPO"
+          echo "Destination: $DEST"
+
+          case "$REPOSITORY_ACTION" in
+            create)
+              if gh repo view "$DEST" >/dev/null 2>&1; then
+                echo "::error::Repository already exists. Select 'use' instead."
+                exit 1
+              fi
+
+              gh repo create "$DEST" "--$VISIBILITY"
+
+              echo "set_default=true" >> "$GITHUB_OUTPUT"
+              ;;
+
+            use)
+              if ! gh repo view "$DEST" >/dev/null 2>&1; then
+                echo "::error::Repository does not exist or GH_PAT cannot access it: $DEST"
+                exit 1
+              fi
+
+              CURRENT_DEFAULT="$(gh repo view "$DEST" \
+                --json defaultBranchRef \
+                --jq '.defaultBranchRef.name // ""')"
+
+              if [[ -z "$CURRENT_DEFAULT" ]]; then
+                echo "set_default=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "set_default=false" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+
+            *)
+              echo "::error::Invalid repository_action: $REPOSITORY_ACTION"
+              exit 1
+              ;;
+          esac
+
+          echo "owner=$DEST_OWNER" >> "$GITHUB_OUTPUT"
+          echo "repo_name=$DEST_REPO" >> "$GITHUB_OUTPUT"
+          echo "repo=$DEST" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch source history and inspect destination branch
+        id: prepare
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          DEST_OWNER: ${{ steps.destination.outputs.owner }}
+          DEST_REPO: ${{ steps.destination.outputs.repo_name }}
+          SOURCE_URL: ${{ inputs.source_url }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          SYNC_MODE: ${{ inputs.sync_mode }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          WORKDIR="$GITHUB_WORKSPACE/mirror-repo"
+          mkdir -p "$WORKDIR"
+          cd "$WORKDIR"
+
+          git init
+
+          if [[ -z "$SOURCE_URL" ]]; then
+            echo "::error::source_url cannot be empty."
+            exit 1
+          fi
+
+          if ! git check-ref-format "refs/heads/$SOURCE_BRANCH"; then
+            echo "::error::Invalid source branch name: $SOURCE_BRANCH"
+            exit 1
+          fi
+
+          if ! git check-ref-format "refs/heads/$TARGET_BRANCH"; then
+            echo "::error::Invalid target branch name: $TARGET_BRANCH"
+            exit 1
+          fi
+
+          if [[ "$SYNC_MODE" != "sync" && "$SYNC_MODE" != "import" ]]; then
+            echo "::error::Invalid sync_mode: $SYNC_MODE"
+            exit 1
+          fi
+
+          git remote add source "$SOURCE_URL"
+
+          git remote add origin \
+            "https://github.com/$DEST_OWNER/$DEST_REPO.git"
+
+          echo "Fetching source branch: $SOURCE_BRANCH"
+
+          git fetch --no-tags source \
+            "+refs/heads/$SOURCE_BRANCH:refs/source/$SOURCE_BRANCH"
+
+          SOURCE_REF="refs/source/$SOURCE_BRANCH"
+
+          if ! git cat-file -e "$SOURCE_REF^{commit}"; then
+            echo "::error::Source branch did not resolve to a commit."
+            exit 1
+          fi
+
+          SOURCE_COUNT="$(git rev-list --count "$SOURCE_REF")"
+          SOURCE_HEAD="$(git rev-parse "$SOURCE_REF")"
+
+          echo "Source HEAD: $SOURCE_HEAD"
+          echo "Reachable source commits: $SOURCE_COUNT"
+
+          # Inspect the selected destination branch, if it exists.
+
+          REMOTE_LINE="$(git ls-remote --heads origin \
+            "refs/heads/$TARGET_BRANCH")"
+
+          TARGET_EXISTS=false
+          TARGET_HAS_FILES=false
+          TARGET_SHA=""
+
+          if [[ -n "$REMOTE_LINE" ]]; then
+            TARGET_EXISTS=true
+            TARGET_SHA="${REMOTE_LINE%%$'\t'*}"
+
+            git fetch --no-tags origin \
+              "+refs/heads/$TARGET_BRANCH:refs/destination/$TARGET_BRANCH"
+
+            if git ls-tree -r --name-only "$TARGET_SHA" |
+              awk 'END { exit (NR == 0) }'; then
+              TARGET_HAS_FILES=true
+            fi
+          fi
+
+          echo "Target branch exists: $TARGET_EXISTS"
+          echo "Target branch has files: $TARGET_HAS_FILES"
+
+          if [[ "$SYNC_MODE" == "import" && "$TARGET_HAS_FILES" == "true" ]]; then
+            echo "::error::Import mode will not overwrite a populated destination branch. Choose sync or a different target branch."
+            exit 1
+          fi
+
+          STAGING_BRANCH="__mirror_staging/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          echo "source_count=$SOURCE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "source_head=$SOURCE_HEAD" >> "$GITHUB_OUTPUT"
+          echo "target_exists=$TARGET_EXISTS" >> "$GITHUB_OUTPUT"
+          echo "target_has_files=$TARGET_HAS_FILES" >> "$GITHUB_OUTPUT"
+          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "staging_branch=$STAGING_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Transfer source history in configurable checkpoints
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          COMMITS_PER_PUSH: ${{ inputs.commits_per_push }}
+          STAGING_BRANCH: ${{ steps.prepare.outputs.staging_branch }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          WORKDIR="$GITHUB_WORKSPACE/mirror-repo"
+          cd "$WORKDIR"
+
+          if [[ ! "$COMMITS_PER_PUSH" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::commits_per_push must be a positive whole number."
+            exit 1
+          fi
+
+          gh auth setup-git --hostname github.com
+
+          SOURCE_REF="refs/source/$SOURCE_BRANCH"
+
+          TOTAL="$(git rev-list --count "$SOURCE_REF")"
+
+          echo "Source commits: $TOTAL"
+          echo "Commits per push: $COMMITS_PER_PUSH"
+          echo "Temporary staging branch: $STAGING_BRANCH"
+
+          CHECKPOINT_COUNT=0
+
+          # Push every Nth commit, oldest first.
+          # The final push transfers the source branch tip.
+
+          while IFS= read -r SHA; do
+            [[ -z "$SHA" ]] && continue
+
+            echo "Pushing checkpoint $((CHECKPOINT_COUNT + 1)): $SHA"
+
+            git push origin \
+              "+$SHA:refs/heads/$STAGING_BRANCH"
+
+            CHECKPOINT_COUNT=$((CHECKPOINT_COUNT + 1))
+
+          done < <(
+            git log --format='%H' --reverse "$SOURCE_REF" |
+              awk -v interval="$COMMITS_PER_PUSH" \
+                'NR % interval == 0 { print $1 }'
+          )
+
+          echo "Checkpoint pushes completed: $CHECKPOINT_COUNT"
+
+          echo "Pushing final source tip..."
+
+          git push origin \
+            "+$SOURCE_REF:refs/heads/$STAGING_BRANCH"
+
+          echo "Source history transfer completed."
+
+      - name: Import or synchronize destination branch
+        id: finish
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          SYNC_MODE: ${{ inputs.sync_mode }}
+          STAGING_BRANCH: ${{ steps.prepare.outputs.staging_branch }}
+          DEST_OWNER: ${{ steps.destination.outputs.owner }}
+          DEST_REPO: ${{ steps.destination.outputs.repo_name }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          WORKDIR="$GITHUB_WORKSPACE/mirror-repo"
+          cd "$WORKDIR"
+
+          gh auth setup-git --hostname github.com
+
+          STAGED_REF="refs/staged-source/$SOURCE_BRANCH"
+
+          git fetch --no-tags origin \
+            "+refs/heads/$STAGING_BRANCH:$STAGED_REF"
+
+          STAGED_HEAD="$(git rev-parse "$STAGED_REF")"
+
+          echo "Staged source HEAD: $STAGED_HEAD"
+
+          # Re-fetch the destination immediately before calculating the update.
+
+          REMOTE_LINE="$(git ls-remote --heads origin \
+            "refs/heads/$TARGET_BRANCH")"
+
+          TARGET_EXISTS=false
+          TARGET_HAS_FILES=false
+          TARGET_SHA=""
+
+          if [[ -n "$REMOTE_LINE" ]]; then
+            TARGET_EXISTS=true
+            TARGET_SHA="${REMOTE_LINE%%$'\t'*}"
+
+            git fetch --no-tags origin \
+              "+refs/heads/$TARGET_BRANCH:refs/destination/$TARGET_BRANCH"
+
+            if git ls-tree -r --name-only "$TARGET_SHA" |
+              awk 'END { exit (NR == 0) }'; then
+              TARGET_HAS_FILES=true
+            fi
+          fi
+
+          if [[ "$SYNC_MODE" == "import" && "$TARGET_HAS_FILES" == "true" ]]; then
+            echo "::error::Destination became populated after the initial check. Refusing to overwrite it."
+            exit 1
+          fi
+
+          if [[ "$TARGET_HAS_FILES" == "true" && "$SYNC_MODE" == "sync" ]]; then
+
+            echo "Populated destination found: synchronizing histories."
+
+            TARGET_REF="refs/destination/$TARGET_BRANCH"
+
+            git switch --force-create mirror-sync-target "$TARGET_REF"
+
+            # Find common ancestor.
+
+            MERGE_BASE="$(git merge-base "$TARGET_REF" "$STAGED_REF" || true)"
+
+            if [[ -n "$MERGE_BASE" ]]; then
+              echo "Common ancestor: $MERGE_BASE"
+            else
+              echo "No common ancestor; attempting an unrelated-histories merge."
+            fi
+
+            # Case 1: Source is already included.
+
+            if git merge-base --is-ancestor "$STAGED_REF" HEAD; then
+
+              echo "All source commits are already present in the destination."
+
+            # Case 2: Destination is behind source.
+
+            elif git merge-base --is-ancestor HEAD "$STAGED_REF"; then
+
+              echo "Destination is behind source; fast-forwarding."
+
+              git merge --ff-only "$STAGED_REF"
+
+            # Case 3: Both histories share an ancestor.
+
+            elif [[ -n "$MERGE_BASE" ]]; then
+
+              echo "Histories diverged; creating a merge commit."
+
+              if ! git merge --no-edit "$STAGED_REF"; then
+                git merge --abort || true
+
+                echo "::error::Automatic merge failed due to conflicts. Destination was not updated."
+                exit 1
+              fi
+
+            # Case 4: Histories have different roots.
+
+            else
+
+              echo "Merging unrelated histories."
+
+              if ! git merge \
+                --allow-unrelated-histories \
+                --no-edit "$STAGED_REF"; then
+
+                git merge --abort || true
+
+                echo "::error::Unrelated-history merge failed due to conflicts. Destination was not updated."
+                exit 1
+              fi
+            fi
+
+            EXPECTED_SHA="$(git rev-parse HEAD)"
+
+            # No force push: concurrent updates and protected branches
+            # are respected.
+
+            git push origin \
+              "HEAD:refs/heads/$TARGET_BRANCH"
+
+            RESULT_MODE=sync
+
+          else
+
+            echo "Destination branch is missing or has no files; performing a fresh import."
+
+            if [[ "$TARGET_EXISTS" == "true" ]]; then
+
+              # Replace an empty branch only if its tip has not changed
+              # since the fetch.
+
+              git push \
+                "--force-with-lease=refs/heads/$TARGET_BRANCH:$TARGET_SHA" \
+                origin \
+                "$STAGED_REF:refs/heads/$TARGET_BRANCH"
+
+            else
+
+              # Create a new target branch without force.
+
+              git push origin \
+                "$STAGED_REF:refs/heads/$TARGET_BRANCH"
+
+            fi
+
+            EXPECTED_SHA="$STAGED_HEAD"
+            RESULT_MODE=import
+
+          fi
+
+          echo "expected_sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
+          echo "result_mode=$RESULT_MODE" >> "$GITHUB_OUTPUT"
+
+          echo "Completed operation: $RESULT_MODE"
+          echo "Destination HEAD: $EXPECTED_SHA"
+
+      - name: Verify destination and configure default branch
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          DEST_OWNER: ${{ steps.destination.outputs.owner }}
+          DEST_REPO: ${{ steps.destination.outputs.repo_name }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          SET_DEFAULT: ${{ steps.destination.outputs.set_default }}
+          EXPECTED_SHA: ${{ steps.finish.outputs.expected_sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          WORKDIR="$GITHUB_WORKSPACE/mirror-repo"
+          cd "$WORKDIR"
+
+          gh auth setup-git --hostname github.com
+
+          DEST="$DEST_OWNER/$DEST_REPO"
+
+          REMOTE_LINE="$(git ls-remote --heads origin \
+            "refs/heads/$TARGET_BRANCH")"
+
+          REMOTE_SHA="${REMOTE_LINE%%$'\t'*}"
+
+          echo "Expected HEAD: $EXPECTED_SHA"
+          echo "Remote HEAD:   $REMOTE_SHA"
+
+          if [[ -z "$REMOTE_SHA" || "$EXPECTED_SHA" != "$REMOTE_SHA" ]]; then
+            echo "::error::Destination branch verification failed."
+            exit 1
+          fi
+
+          if [[ "$SET_DEFAULT" == "true" ]]; then
+
+            gh repo edit "$DEST" \
+              --default-branch "$TARGET_BRANCH"
+
+            echo "Default branch set to: $TARGET_BRANCH"
+
+          else
+
+            echo "Existing default branch left unchanged."
+
+          fi
+
+          echo "========================================"
+          echo "IMPORT/SYNC SUCCESSFUL"
+          echo "========================================"
+
+          echo "Repository: https://github.com/$DEST"
+          echo "Branch: $TARGET_BRANCH"
+          echo "HEAD: $REMOTE_SHA"
+
+      - name: Delete temporary staging branch
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          STAGING_BRANCH: ${{ steps.prepare.outputs.staging_branch }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "${STAGING_BRANCH:-}" ]]; then
+            exit 0
+          fi
+
+          WORKDIR="$GITHUB_WORKSPACE/mirror-repo"
+
+          if [[ ! -d "$WORKDIR/.git" ]]; then
+            exit 0
+          fi
+
+          gh auth setup-git --hostname github.com
+
+          git -C "$WORKDIR" push origin \
+            --delete "$STAGING_BRANCH" || true
